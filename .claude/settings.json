@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"https://noaa-gefs-pds.s3.amazonaws.com/gefs.20201001/12/atmos/pgrb2ap5/gec00.t12z.pgrb2a.0p50.f024.idx\")",
+      "Bash(curl -s \"https://noaa-gefs-pds.s3.amazonaws.com/gefs.20201001/12/atmos/pgrb2sp25/gec00.t12z.pgrb2s.0p25.f024.idx\")",
+      "Bash(curl -s \"https://noaa-gefs-pds.s3.amazonaws.com/gefs.20200601/12/pgrb2a/gec00.t12z.pgrb2af24.idx\")",
+      "Bash(curl -s \"https://noaa-gefs-pds.s3.amazonaws.com/?list-type=2&prefix=gefs.20200601/12/pgrb2b/&max-keys=5\")",
+      "Bash(curl -s \"https://noaa-gefs-pds.s3.amazonaws.com/gefs.20200601/12/pgrb2b/gec00.t12z.pgrb2bf24.idx\")",
+      "Read(//home/sean834/squallcast/training_dataset/targets/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -sI \"https://noaa-gefs-pds.s3.amazonaws.com/gefs.20200601/12/pgrb2a/gec00.t12z.pgrb2af24\")",
+      "Bash(curl -sI \"https://noaa-gefs-pds.s3.amazonaws.com/gefs.20201001/12/atmos/pgrb2ap5/gec00.t12z.pgrb2a.0p50.f024\")",
+      "Bash(rm -rf /home/sean834/squallcast/training_dataset/predictors/gefs_profiles_test /tmp/test_pre.grib2 /tmp/test_post.grib2 /tmp/idx_pre.txt /tmp/idx_post.txt)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

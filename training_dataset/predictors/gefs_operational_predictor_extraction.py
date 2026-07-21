@@ -1,18 +1,19 @@
-#!/usr/bin/env python3
 """
 Extract GEFS vertical-profile predictors at each snow squall target location.
 
 For every target in `snow_squall_targets.csv`, this script pulls a GEFS
-control-run ("Day 1") forecast profile at the nearest gridpoint:
+control-run "Day 1" forecast profile at the nearest gridpoint:
 
   * Initialization : 12Z the calendar day *before* the warning was issued
-  * Forecast hour   : f024 (~24 hour lead time), so all events share the
-                       same lead time regardless of when during the day
-                       the warning was actually issued.
+  * Forecast hour   : whichever GEFS lead time (f000, f003, ... or f000,
+                       f006, ... depending on era) falls closest to the
+                       actual warning issuance time, so each event uses a
+                       ~12-36 hour lead time rather than a fixed one.
   * Member          : control run (gec00)
   * Fields          : HGT, TMP, RH, UGRD, VGRD on mandatory pressure levels,
                        plus 2 m TMP/RH/DPT(derived), 10 m UGRD/VGRD, PRMSL,
-                       SNOD, WEASD, APCP (18-24h accum), CSNOW (18-24h avg).
+                       SNOD, WEASD, APCP (accumulated since prior fcst hour),
+                       CSNOW (categorical snow flag).
 
 Data source
 -----------
@@ -58,8 +59,13 @@ log = logging.getLogger("gefs_operational_predictor_extraction")
 BASE_URL = "https://noaa-gefs-pds.s3.amazonaws.com"
 UPGRADE_DATE = date(2020, 9, 23)  # GEFSv12 operational upgrade
 
-FORECAST_HOUR = 24
 MEMBER = "gec00"  # control run
+
+# Available forecast-hour steps for the pgrb2a product, by era.
+# pre-upgrade  (GEFSv11) : 6-hourly, 0-384h
+# post-upgrade (GEFSv12) : 3-hourly to 240h, then 6-hourly to 384h
+PRE_UPGRADE_FCST_HOURS = list(range(0, 384 + 1, 6))
+POST_UPGRADE_FCST_HOURS = list(range(0, 240 + 1, 3)) + list(range(246, 384 + 1, 6))
 
 REQUEST_TIMEOUT = 120
 HTTP_RETRIES = 3
@@ -109,8 +115,8 @@ def http_head_ok(url: str) -> bool:
 # URL construction
 # --------------------------------------------------------------------------- #
 
-def gefs_grib_url(init_dt: datetime) -> str:
-    """Return the URL of the gec00 pgrb2a f024 file for this init time.
+def gefs_grib_url(init_dt: datetime, forecast_hour: int) -> str:
+    """Return the URL of the gec00 pgrb2a file for this init time + lead hour.
 
     Tries the post-GEFSv12 layout first, falls back to the pre-upgrade one.
     """
@@ -119,11 +125,11 @@ def gefs_grib_url(init_dt: datetime) -> str:
 
     post_url = (
         f"{BASE_URL}/gefs.{ymd}/{hh}/atmos/pgrb2ap5/"
-        f"{MEMBER}.t{hh}z.pgrb2a.0p50.f{FORECAST_HOUR:03d}"
+        f"{MEMBER}.t{hh}z.pgrb2a.0p50.f{forecast_hour:03d}"
     )
     pre_url = (
         f"{BASE_URL}/gefs.{ymd}/{hh}/pgrb2a/"
-        f"{MEMBER}.t{hh}z.pgrb2af{FORECAST_HOUR:02d}"
+        f"{MEMBER}.t{hh}z.pgrb2af{forecast_hour:02d}"
     )
 
     if init_dt.date() >= UPGRADE_DATE:
@@ -135,13 +141,27 @@ def gefs_grib_url(init_dt: datetime) -> str:
         if http_head_ok(url):
             return url
 
-    raise FileNotFoundError(f"No GEFS pgrb2a file found for init {init_dt.isoformat()} at either layout")
+    raise FileNotFoundError(
+        f"No GEFS pgrb2a file found for init {init_dt.isoformat()} f{forecast_hour:03d} at either layout"
+    )
 
 
 def init_datetime_for_event(issued_utc: datetime) -> datetime:
     """12Z the calendar day before the warning was issued."""
     day_before = issued_utc.date() - timedelta(days=1)
     return datetime(day_before.year, day_before.month, day_before.day, 12, tzinfo=timezone.utc)
+
+
+def nearest_forecast_hour(init_dt: datetime, issued_utc: datetime) -> tuple[int, float]:
+    """Return (forecast_hour, lead_hours) for the GEFS lead time closest to issuance.
+
+    `lead_hours` is the *actual* (fractional) time between init and issuance;
+    `forecast_hour` is the nearest available GEFS archive step to that lead.
+    """
+    lead_hours = (issued_utc - init_dt).total_seconds() / 3600.0
+    available = PRE_UPGRADE_FCST_HOURS if init_dt.date() < UPGRADE_DATE else POST_UPGRADE_FCST_HOURS
+    forecast_hour = min(available, key=lambda fh: abs(fh - lead_hours))
+    return forecast_hour, lead_hours
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +172,8 @@ def init_datetime_for_event(issued_utc: datetime) -> datetime:
 class GefsProfile:
     init_time: datetime
     valid_time: datetime
+    forecast_hour: int
+    lead_hours: float
     grid_lat: float
     grid_lon: float
     profile: dict  # var -> {level: value}
@@ -268,7 +290,8 @@ def build_dataset(warning_row: pd.Series, gp: GefsProfile) -> xr.Dataset:
             "target_lon": float(warning_row["target_lon"]),
             "gefs_init_time_utc": gp.init_time.isoformat(),
             "gefs_valid_time_utc": gp.valid_time.isoformat() if gp.valid_time else "",
-            "gefs_forecast_hour": FORECAST_HOUR,
+            "gefs_forecast_hour": gp.forecast_hour,
+            "gefs_lead_hours": gp.lead_hours,
             "gefs_member": MEMBER,
             "gefs_grid_lat": gp.grid_lat,
             "gefs_grid_lon": gp.grid_lon,
@@ -310,17 +333,28 @@ def process_all(targets: pd.DataFrame, output_dir: str, limit: Optional[int] = N
 
     for i, row in enumerate(targets.itertuples(index=False), 1):
         warning_id = row.warning_id
-        out_path = os.path.join(output_dir, f"{warning_id}.nc")
+        issued_utc = row.issued_utc.to_pydatetime()
+        init_dt = init_datetime_for_event(issued_utc)
+        forecast_hour, lead_hours = nearest_forecast_hour(init_dt, issued_utc)
+
+        out_name = (
+            f"{warning_id}"
+            f"_issued{issued_utc:%Y%m%dT%H%M%SZ}"
+            f"_gefs{init_dt:%Y%m%dT%Hz}"
+            f"_f{forecast_hour:03d}.nc"
+        )
+        out_path = os.path.join(output_dir, out_name)
         if os.path.exists(out_path) and not overwrite:
             log.info("[%d/%d] %s already extracted, skipping", i, total, warning_id)
             continue
 
-        issued_utc = row.issued_utc.to_pydatetime()
-        init_dt = init_datetime_for_event(issued_utc)
-        log.info("[%d/%d] %s issued %s -> GEFS init %s f%03d", i, total, warning_id, issued_utc, init_dt, FORECAST_HOUR)
+        log.info(
+            "[%d/%d] %s issued %s -> GEFS init %s, lead %.1fh -> f%03d",
+            i, total, warning_id, issued_utc, init_dt, lead_hours, forecast_hour,
+        )
 
         try:
-            url = gefs_grib_url(init_dt)
+            url = gefs_grib_url(init_dt, forecast_hour)
 
             if url != cache_url:
                 if cache_path and os.path.exists(cache_path):
@@ -335,6 +369,8 @@ def process_all(targets: pd.DataFrame, output_dir: str, limit: Optional[int] = N
             gp = GefsProfile(
                 init_time=init_dt,
                 valid_time=valid_time,
+                forecast_hour=forecast_hour,
+                lead_hours=lead_hours,
                 grid_lat=grid_lat,
                 grid_lon=grid_lon,
                 profile=profile,

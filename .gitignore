@@ -1,2 +1,16 @@
 .vscode/
 .claude/
+
+# Ignore data in the project
+*.nc
+*.grib2
+*.csv
+*.parquet
+*.png
+*.pyc
+*.npy
+*.h5
+
+# Ignore data folders
+gefs_profiles/
+visual_samples/
